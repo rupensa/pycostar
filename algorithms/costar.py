@@ -2,6 +2,7 @@ import logging
 from random import choice
 from random import randint
 from time import time
+from typing import List
 
 import numpy as np
 import scipy
@@ -17,7 +18,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
     """ CoStar algorithm (Ienco, 2013).
 
     CoStar is an algorithm created to deal with multi-view data.
-    It finds automatically the best number of row / column clusters.
+    It found automatically the best number of row / column clusters.
 
     Parameters
     ------------
@@ -53,9 +54,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
     columns_ : array-like, shape (n_view, n_features_per_view)
         Results of the clustering on columns, for each view is like `rows`.
-        
-    execution_time_ : float
-        The execution time. 
 
     References
     ----------
@@ -66,6 +64,18 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
     """
 
     def __init__(self, n_iterations=500, min_n_row_clusters=2, init='standard_without_merge', scaling_factor=0.1):
+        """
+        Create the model object and initialize the required parameters.
+
+        :type n_iterations: int
+        :param n_iterations: the max number of iterations to perform
+        :type min_n_row_clusters: int
+        :param min_n_row_clusters: the minimum number of row clusters
+        :type init: str
+        :param init: the initialization method, one of {'standard_without_merge', 'standard_with_merge', 'random', 'kmeans'}
+        :type scaling_factor: float
+        :param scaling_factor: the scaling factor to use during partition initialization, parameter used only with kmeans initialization
+        """
 
         self.n_iterations = n_iterations
         self.min_n_row_clusters = max(min_n_row_clusters, 2)
@@ -85,7 +95,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         :param V: the dataset
         :return:
         """
-
         # verify that all matrices are correctly represented
         # check_array is a sklearn utility method
         self._dataset = [None] * len(V)
@@ -108,6 +117,9 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         # Support values to compute delta tau for rows
         self._Ir = 0.0
         self._Cr = 0.0
+        self._ir_acc = None # np.zeros(self._n_views)
+        self._cr_acc = None # np.zeros(self._n_views)
+
 
         # the number of documents in the data
         self._n_documents = self._dataset[0].shape[0]
@@ -156,6 +168,9 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         # sum of (data values ^ 2) per col cluster
         self._tot_t_square_per_cc = None
 
+        # computation time
+        self.execution_time_ = 0
+
         if self.initialization_mode == 'random':
             self._random_initialization()
         elif self.initialization_mode == 'kmeans':
@@ -165,7 +180,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         else:
             self._discrete_initialization(merge_identical_objects=False)
 
-        self._update_I_and_C()
+        self._init_intermediate_values()
 
         self._performed_moves_on_rows = 0
         self._performed_moves_on_cols = [0] * self._n_views
@@ -174,13 +189,21 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         logging.debug("[INFO] Col's initialization: {0}".format([list(c) for c in self._col_assignment]))
 
     def fit(self, V, y=None):
-        """Compute coclusters for the provided data using costar.
+        """
+        Fit CoStar to the provided data.
 
         Parameters
-        ----------
+        -----------
 
         V : list of array-like or sparse matrices, one for each view;
             shape of each matrix = (n_samples, n_features_in_view)
+
+        y : unused parameter
+
+        Returns
+        --------
+
+        self
 
         """
 
@@ -193,19 +216,21 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         actual_n_iterations = 0
 
         while actual_n_iterations != self.n_iterations:
+            # each iterations performs a move on rows and n_view moves on columns
+
             iter_start_time = time()
             logging.debug("[INFO] ##############################################\n" +
                          "\t\t### Iteration {0}".format(actual_n_iterations))
 
             if actual_n_iterations % 100 == 0:
-                logging.info("Iteration #{0}".format(actual_n_iterations))
+                logging.debug("Iteration #{0}".format(actual_n_iterations))
 
-            # update row
-            # logging.debug("[INFO] Row partitioning")
-            self._row_partition_clustering()
-            for view in range(self._n_views):
-                # logging.debug("[INFO] View #{0} column partitioning".format(view))
-                self._column_partition_clustering(view)
+            # perform a move within the rows partition
+            self._perform_row_move()
+            for view_index in range(self._n_views):
+                # perform a move within each columns partition
+                self._perform_column_move(view_index)
+
             actual_n_iterations += 1
             iter_end_time = time()
             logging.debug("[INFO] # row clusters: {0}; # col clusters: {1}".format(self._n_row_clusters, self._n_col_clusters))
@@ -217,6 +242,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         logging.info('#####################################################')
         logging.info("[INFO] Execution time: {0}".format(execution_time))
 
+        # clone cluster assignments and transform in lists
         self.rows_ = np.copy(self._row_assignment).tolist()
         self.columns_ = [list(np.copy(r)) for r in self._col_assignment]
         self.execution_time_ = execution_time
@@ -230,7 +256,12 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         return self
 
     def _kmeans_initialization(self):
-        # init number of clusters
+        """
+        Initialize clusters on rows and columns using kmeans. The initial number of clusters is set with respect to the
+        number of instance using the scaling factor provided in input to the constructor.
+
+        :return:
+        """
         self._n_col_clusters = [int(max(n * self.initialization_scaling_factor, 2)) for n in self._n_features_per_view]
         self._n_row_clusters = int(max(self._n_documents * self.initialization_scaling_factor, 2))
 
@@ -257,14 +288,14 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         self._row_assignment = kmeans.fit_predict(all_dataset)
 
         # compute the contingency matrix for the new assignment
-        self._T = self._compute_contingency_matrix_T()
+        self._T = self._init_contingency_matrix()
 
         # update the T related matrices
         self._init_T_derived_fields()
 
     def _random_initialization(self):
         """
-        Randomly initialize clusters on rows and columns
+        Randomly initialize clusters on rows and columns.
 
         :return:
         """
@@ -279,7 +310,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             self._n_col_clusters[k] = self._random_columns_initialization_for_view(k)
 
         # update the contingency matrix and derivated fields
-        self._T = self._compute_contingency_matrix_T()
+        self._T = self._init_contingency_matrix()
 
         # update the T related matrices
         self._init_T_derived_fields()
@@ -288,8 +319,10 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         """
         Randomly initialize clusters for columns of a specific view
 
-        :param view_index: int, the index of the view to be considered
-        :return: int, the number of created clusters
+        :type view_index: int
+        :param view_index: the index of the view to be considered
+        :rtype: int
+        :return: the number of created clusters
         """
         n_features = self._n_features_per_view[view_index]
         if n_features > 3:
@@ -326,7 +359,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         return new_n_row_clusters
 
-    def _discrete_initialization(self, merge_identical_objects=True):
+    def _discrete_initialization(self, merge_identical_objects=False):
         """
         This initialization method basically assign each row to a new cluster and each feature to a column cluster.
         Note that if the merge_identical_objects parameter is set to True, identical rows (or respectively columns)
@@ -414,28 +447,24 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             # save the number of row clusters
             self._n_row_clusters = next_row_cluster_index
 
-            # logging.debug("[INFO] Completed rows assignment.")
-
             # compute the contingency matrix for the new assignment
-            self._T = self._compute_contingency_matrix_T()
+            self._T = self._init_contingency_matrix()
 
             # update the T related matrices
             self._init_T_derived_fields()
 
 
-    def _compute_contingency_matrix_T(self):
+    def _init_contingency_matrix(self):
         """
         Initialize the T contingency matrix for all views. This object contains for each view a matrix
         of shape = (n_row_clusters, n_col_clusters[v])
 
-        :param update_related_fields: boolean, default True
-                Updates the matrices directly dependent by T (self._nTot, self._nTot_pow, self._two_dividedby_nTot)
         :return:
         """
         logging.debug("[INFO] Compute the contingency matrix...")
 
         if issparse(self._dataset[0]):
-            new_t = self._compute_contingency_matrix_T_sparse()
+            new_t = self._compute_contingency_matrix_sparse()
         else:
             # dense case
             new_t = [None] * self._n_views
@@ -454,7 +483,12 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         logging.debug("[INFO] End of contingency matrix computation...")
         return new_t
 
-    def _compute_contingency_matrix_T_sparse(self):
+    def _compute_contingency_matrix_sparse(self):
+        """
+        Initialize the contingency matrix for the sparse dataset case.
+
+        :return:
+        """
         new_t = [None] * self._n_views
 
         for vi in range(self._n_views):
@@ -472,7 +506,8 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
     def _init_T_derived_fields(self):
         """
-        Initialize the following lists:
+        Initialize the following lists and values:
+
         * total sum of values per view,
         * pow(total) per view,
         * 2/total per view
@@ -486,15 +521,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         logging.debug("[INFO] Init fields derived by the contingency matrix...")
 
-        # list of totals for each view
-        self._tot_per_view = [t.sum() for t in self._T]
-
-        # list of totals ^ 2 for each view
-        self._square_tot_per_view = np.power(self._tot_per_view, 2)
-
-        # list of 2 / total for each view
-        self._two_divided_by_tot_per_view = np.apply_along_axis(lambda x: 2/x, 0, self._tot_per_view)
-
         # sum of data values per row cluster
         self._tot_t_per_rc = np.empty(self._n_views, np.ndarray)
 
@@ -507,64 +533,138 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         # sum of (data values ^ 2) per col cluster
         self._tot_t_square_per_cc = np.empty(self._n_views, np.ndarray)
 
+        # square of the T matrix
+        self._t_square = np.empty(self._n_views, np.ndarray)
+
         # compute some support values
         for view in range(self._n_views):
-            view_square = np.power(self._T[view], 2)
+            self._t_square[view] = np.power(self._T[view], 2)
             # sum per row of T[view] (axis = 1)
             self._tot_t_per_rc[view] = np.sum(self._T[view], 1)
-            self._tot_t_square_per_rc[view] = np.sum(view_square, 1)
+            self._tot_t_square_per_rc[view] = np.sum(self._t_square[view], 1)
             # sum per col of T[view] (axis = 0)
             self._tot_t_per_cc[view] = np.sum(self._T[view], 0)
-            self._tot_t_square_per_cc[view] = np.sum(view_square, 0)
+            self._tot_t_square_per_cc[view] = np.sum(self._t_square[view], 0)
 
-    def _update_I_and_C(self):
+        # list of totals for each view
+        self._tot_per_view = [v.sum() for v in self._tot_t_per_rc]
+
+        # list of totals ^ 2 for each view
+        self._square_tot_per_view = np.power(self._tot_per_view, 2)
+
+        # list of 2 / total for each view
+        self._two_divided_by_tot_per_view = np.apply_along_axis(lambda x: 2 / x, 0, self._tot_per_view)
+
+    def _init_intermediate_values(self):
         """
         Updates the following instance values:
 
-        - self.Ic, array, length = n_views,
-        - self.Cc, array, length = n_views,
-        - self.Ir, double,
-        - self.Cr, double,
+        - self._Ic, array, length = n_views,
+        - self._Cc, array, length = n_views,
+        - self._Ir, double,
+        - self._Cr, double,
+        - self._ir_acc, array, length = n_views
+        - self._cr_acc, array, length = n_views
         :return:
         """
 
-        ir_acc = 0.0
-        cr_acc = 0.0
+        self._ir_acc = np.empty(self._n_views, np.float)
+        self._cr_acc = np.empty(self._n_views, np.float)
 
         for view in range(self._n_views):
             # compute I
+            # sum(tot_t_per_cc[v] ^ 2)
             sum_i = np.sum(np.power(self._tot_t_per_cc[view], 2))
+            # 1 - [sum(tot_t_per_cc[v] ^ 2) / (total_per_view[v] ^ 2)]
             self._Ic[view] = 1 - (sum_i / self._square_tot_per_view[view])
 
             # compute C
+            # sum(tot_t_square_per_rc[v] / tot_t_per_rc[v])
             sum_c = np.nansum(np.true_divide(self._tot_t_square_per_rc[view], self._tot_t_per_rc[view]))
+            # 1 - { [sum(tot_t_square_per_rc[v] / tot_t_per_rc[v])] / tot_per_view[v]}
             self._Cc[view] = 1 - (sum_c / self._tot_per_view[view])
 
             # accumulate on i_acc for this view
+            # sum(tot_t_per_rc[v] ^ 2)
             sum_ir = np.sum(np.power(self._tot_t_per_rc[view], 2))
-            ir_acc += (sum_ir / self._square_tot_per_view[view])
+            # sum(tot_t_per_rc[v] ^ 2) / square_tot_per_view[v] -- sum over all views
+            self._ir_acc[view] = (sum_ir / self._square_tot_per_view[view])
 
             # accumulate on c_acc for this view
+            # sum(tot_t_square_per_cc[v] / tot_t_per_cc[v])
             sum_cr = np.nansum(np.true_divide(self._tot_t_square_per_cc[view], self._tot_t_per_cc[view]))
-            cr_acc += (sum_cr / self._tot_per_view[view])
+            # [sum(tot_t_square_per_cc[v] / tot_t_per_cc[v])] / tot_per_view[v]
+            self._cr_acc[view] = (sum_cr / self._tot_per_view[view])
 
-        self._Ir = self._n_views - ir_acc
-        self._Cr = self._n_views - cr_acc
+        self._Ir = self._n_views - np.sum(self._ir_acc)
+        self._Cr = self._n_views - np.sum(self._cr_acc)
 
-    def _row_partition_clustering(self):
+    def _update_intermediate_values_after_row_move(self):
         """
-        Perform partitioning of the rows.
+        Updates the following values:
+
+        - self.Cc, array, length = n_views,
+        - self.Ir, double,
+        - self._ir_acc, array, length = n_views
+        :return:
+        """
+
+        # it is necessary to update items of all views
+
+        for view in range(self._n_views):
+            # compute C
+            # sum(tot_t_square_per_rc[v] / tot_t_per_rc[v])
+            sum_c = np.nansum(np.true_divide(self._tot_t_square_per_rc[view], self._tot_t_per_rc[view]))
+            # 1 - { [sum(tot_t_square_per_rc[v] / tot_t_per_rc[v])] / tot_per_view[v]}
+            self._Cc[view] = 1 - (sum_c / self._tot_per_view[view])
+
+            # accumulate on i_acc for this view
+            # sum(tot_t_per_rc[v] ^ 2)
+            sum_ir = np.sum(np.power(self._tot_t_per_rc[view], 2))
+            # sum(tot_t_per_rc[v] ^ 2) / square_tot_per_view[v] -- sum over all views
+            self._ir_acc[view] = (sum_ir / self._square_tot_per_view[view])
+
+        self._Ir = self._n_views - np.sum(self._ir_acc)
+
+    def _update_intermediate_values_after_column_move(self, involved_view):
+        """
+        Updates the following instance values:
+
+        - self._Ic, array, length = n_views,
+        - self._cr_acc, array, length = n_views,
+        - self._Cr, double,
+        :return:
+        """
+
+        # only the involved view values need to be updated
+
+        # compute I
+        # sum(tot_t_per_cc[v] ^ 2)
+        sum_i = np.sum(np.power(self._tot_t_per_cc[involved_view], 2))
+        # 1 - [sum(tot_t_per_cc[v] ^ 2) / (total_per_view[v] ^ 2)]
+        self._Ic[involved_view] = 1 - (sum_i / self._square_tot_per_view[involved_view])
+
+        # accumulate on c_acc for this view
+        # sum(tot_t_square_per_cc[v] / tot_t_per_cc[v])
+        sum_cr = np.nansum(np.true_divide(self._tot_t_square_per_cc[involved_view], self._tot_t_per_cc[involved_view]))
+        # [sum(tot_t_square_per_cc[v] / tot_t_per_cc[v])] / tot_per_view[v]
+        self._cr_acc[involved_view] = (sum_cr / self._tot_per_view[involved_view])
+
+        self._Cr = self._n_views - np.sum(self._cr_acc)
+
+    def _perform_row_move(self):
+        """
+        Perform a single move to improve the partition on rows.
 
         :return:
         """
 
-        # init at random row cluster
-        selected_cluster = randint(1, self._n_row_clusters * 100) % self._n_row_clusters
+        # select a random row cluster
+        selected_source_cluster = randint(1, self._n_row_clusters * 100) % self._n_row_clusters
 
-        # init at random element of selected_cluster
-        selected_element = choice(np.where(self._row_assignment == selected_cluster)[0])
+        # select a random element of selected_cluster
+        selected_element = choice(np.where(self._row_assignment == selected_source_cluster)[0])
 
-        # logging.debug("[INFO] Selected row = {0}".format(selected_element))
         lambdas, sum_lambdas = self._compute_lambdas_per_row(selected_element)
 
         # get the number of clusters considering one empty cluster (that can be created during this iteration),
@@ -572,7 +672,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         # will not be allowed
         n_row_clusters_plus_one_empty = min(self._n_documents, self._n_row_clusters + 1)
 
-        all_delta_tau_r = self._delta_tau_r_cumulative(self._tot_t_per_cc, sum_lambdas, lambdas, selected_cluster)
+        all_delta_tau_r = self._delta_tau_r_cumulative(self._tot_t_per_cc, sum_lambdas, lambdas, selected_source_cluster)
 
         # consider all partitions of the neighborhood of the randomly selected cluster, i.e. partitions where the
         # random_object is moved to another existent cluster or to the empty cluster
@@ -584,21 +684,20 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         if min_delta_tau_r != 0:
             if len(equal_solutions) > 1:
                 # logging.debug('[INFO] Tau', min_delta_tau_r)
-                e_min = self._find_non_dominated_row(equal_solutions, lambdas, selected_cluster)
+                e_min = self._find_non_dominated_row(equal_solutions, lambdas, selected_source_cluster)
 
             go_on_normally = True
-            if self._n_row_clusters == self.min_n_row_clusters:  # or e_min == self._n_row_clusters:
+            if self._n_row_clusters == self.min_n_row_clusters:
                 # if the number of row cluster is already equal to min check that the move will not delete a cluster
-                go_on_normally = self._check_row_clustering_size(selected_cluster)
+                go_on_normally = self._check_row_clustering_size(selected_source_cluster)
 
             if go_on_normally:
                 # go with the move
                 self._row_assignment[selected_element] = e_min
-                self._modify_row_cluster(lambdas, selected_cluster, e_min)
-                # TODO perform incrementally within the modify_* functions
-                self._update_I_and_C()
+                self._modify_row_cluster(lambdas, selected_source_cluster, e_min)
+                self._update_intermediate_values_after_row_move()
         else:
-            logging.debug("[INFO] Ignored move of row {2} from row cluster {0} to {1}".format(selected_cluster,
+            logging.debug("[INFO] Ignored move of row {2} from row cluster {0} to {1}".format(selected_source_cluster,
                                                                                              e_min, selected_element))
 
     def _compute_lambdas_per_row(self, selected_row):
@@ -607,9 +706,11 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         In particular:
         * lambdas, array-like, shape = (n_view, n_col_cluster[view]),
-                    contains for each view and for each column cluster, the sum of data related to the selected row.
+                    contains for each view and for each column cluster, the sum of data related to the selected row;
+                    i.e. the portion of the column cluster that should be moved
         * sum_lambdas, array, length n_view,
                     contains for each view the sum of the row data
+                    i.e. the sum of the portion of each view related to the selected element
 
         :param selected_row: int, the id of the selected element
         :return: a pair (lambdas, sum_lambdas),
@@ -680,11 +781,13 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                     subtraction_two[view] = np.subtract(lambdas[view], self._T[view][original_cluster])
 
                 if destination_cluster == self._n_row_clusters:
+                    # is the empty cluster
                     x_array[view] = np.nansum(np.multiply(division_one[view],
                                                           subtraction_one[view]))
                     y_array[view] = np.nansum(subtraction_two[view])
 
                 else:
+                    # already existent cluster
                     x_array[view] = np.nansum(np.multiply(division_one[view],
                                                           np.subtract(subtraction_one[view],
                                                                       self._T[view][destination_cluster])))
@@ -773,7 +876,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         best_solution = equal_solutions[0]
         tau_c_best_solution = self._compute_emulated_tau_c(lambdas, original_cluster, best_solution)
 
-        for ci in range(len(equal_solutions)):
+        for ci in range(1, len(equal_solutions)):
             evaluated_solution = equal_solutions[ci]
             tau_c_evaluated_solution = self._compute_emulated_tau_c(lambdas, original_cluster, evaluated_solution)
             best_count = 0
@@ -801,7 +904,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         :param destination_cluster: int, the row cluster into which we want to move the document
         :return: the value of the compute_tau_c function after the simulated move
         """
-        temp_n_row_clusters = self._n_row_clusters
         temp_t = [None] * self._n_views
 
         if destination_cluster == self._n_row_clusters:
@@ -813,16 +915,10 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 temp_t[view][source_cluster] -= lambda_t[view]
                 # add the new row at the end
                 temp_t[view] = np.vstack([temp_t[view], lambda_t[view]])
-
-            temp_n_row_clusters += 1
         else:
             # we simulate the move of object x from the original cluster to the destination cluster
             # check that the original cluster is not empty
             is_empty = not self._check_row_clustering_size(source_cluster, 2)
-
-            if is_empty:
-                # update the number of cluster
-                temp_n_row_clusters -= 1
 
             for view in range(self._n_views):
                 # create the smaller T matrix
@@ -836,14 +932,13 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
                 # note: it's not necessary to update the row assignment for this simulation
 
-        return self._compute_tau_c(temp_t, temp_n_row_clusters)
+        return self._compute_tau_c(temp_t)
 
-    def _compute_tau_c(self, temp_t=None, temp_n_row_clusters=None):
+    def _compute_tau_c(self, temp_t=None):
         """
         Compute a tau_c value for each view
 
         :param temp_t: the temporary T matrix, if None use self._T
-        :param temp_n_row_clusters: the temporary value for n_row_cluster, if None use self._n_row_clusters
         :return:
         """
 
@@ -874,7 +969,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         return result
 
-    def _compute_tau_r(self, view, temp_t_view=None, temp_n_col_clusters=None):
+    def _compute_tau_r(self, view, temp_t_view=None):
         """
         Compute tau_r value for the specified view.
         Tau_r is the equivalent of tau(X|Yv) where X is the
@@ -882,7 +977,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         :param view: the view to consider
         :param temp_t_view: the temporary T matrix, if None use self._T
-        :param temp_n_col_clusters: the temporary value for n_col_clusters, if None use self._n_col_clusters
         :return:
         """
         if temp_t_view is None:
@@ -950,10 +1044,11 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         :return:
         """
         logging.debug("[INFO] Move element from row cluster {0} to {1}".format(source_rc, destination_rc))
+
         if destination_rc == self._n_row_clusters:
+            # the destination cluster is a new one
             logging.debug("[INFO] Create new cluster {0}".format(destination_rc))
 
-            # the destination cluster is a new one
             for view in range(self._n_views):
                 # add the row for the new row cluster
                 self._T[view] = np.concatenate((self._T[view], [lambda_t[view]]), axis=0)
@@ -970,14 +1065,14 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 self._tot_t_per_rc[view] = np.concatenate((self._tot_t_per_rc[view], [lambda_tot]))
                 # for squares we have to recompute the squares for the source_rc
                 # and to add the new value to the new cluster
-                t_square = np.power(self._T[view], 2)
-                self._tot_t_square_per_rc[view][source_rc] = np.sum(t_square[source_rc])
+                self._t_square[view] = np.power(self._T[view], 2)
+                self._tot_t_square_per_rc[view][source_rc] = np.sum(self._t_square[view][source_rc])
                 self._tot_t_square_per_rc[view] = np.concatenate(
                     (self._tot_t_square_per_rc[view],
-                     [np.sum(t_square[self._n_row_clusters])]))
+                     [np.sum(self._t_square[view][self._n_row_clusters])]))
 
                 # update sum of squares per col clusters
-                self._tot_t_square_per_cc[view] = np.sum(t_square, 0)
+                self._tot_t_square_per_cc[view] = np.sum(self._t_square[view], 0)
 
             self._n_row_clusters += 1
         else:
@@ -992,15 +1087,16 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 # we have to remove from tot_t_per_rc[view][source_rc] the value sum(lambda_t[view])
                 # we have to add a new element to tot_t_per_rc[view] equal to sum(lambda_t[view])
                 lambda_tot = np.sum(lambda_t[view])
-                t_square = np.power(self._T[view], 2)
+                # todo is only necessary to update t square
+                self._t_square[view] = np.power(self._T[view], 2)
                 self._tot_t_per_rc[view][source_rc] -= lambda_tot
                 self._tot_t_per_rc[view][destination_rc] += lambda_tot
                 # for squares we have to recompute the squares for the source_rc
                 # and to add the new value to the new cluster
-                self._tot_t_square_per_rc[view][source_rc] = np.sum(t_square[source_rc])
-                self._tot_t_square_per_rc[view][destination_rc] = np.sum(t_square[destination_rc])
+                self._tot_t_square_per_rc[view][source_rc] = np.sum(self._t_square[view][source_rc])
+                self._tot_t_square_per_rc[view][destination_rc] = np.sum(self._t_square[view][destination_rc])
                 # completely update tot_square_per_cc
-                self._tot_t_square_per_cc[view] = np.sum(t_square, 0)
+                self._tot_t_square_per_cc[view] = np.sum(self._t_square[view], 0)
 
             # check that the original cluster has at least one remaining element
             is_empty = not self._check_row_clustering_size(source_rc, min_number_of_elements=1)
@@ -1023,21 +1119,23 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         self._performed_moves_on_rows += 1
 
-    def _column_partition_clustering(self, view):
+    def _perform_column_move(self, view_index):
         """
-        Perform partitioning of the columns.
+        Perform a single move on the columns partition related to the indicated view.
 
+        :param view_index: the index of the view to consider
         :return:
         """
-        selected_cluster = randint(1, self._n_col_clusters[view] * 100) % self._n_col_clusters[view]
-        selected_feature = choice(np.where(self._col_assignment[view] == selected_cluster)[0])
+        # select randomly a cluster and a column within the cluster
+        selected_cluster = randint(1, self._n_col_clusters[view_index] * 100) % self._n_col_clusters[view_index]
+        selected_feature = choice(np.where(self._col_assignment[view_index] == selected_cluster)[0])
 
-        lambdas, sum_lambdas = self._compute_lambdas_per_col(view, selected_feature)
+        lambdas, sum_lambdas = self._compute_lambdas_per_col(view_index, selected_feature)
 
-        n_col_clusters_plus_one_empty = self._n_features_per_view[view] if \
-            ((self._n_col_clusters[view] + 1) > self._n_features_per_view[view]) else (self._n_col_clusters[view] + 1)
+        n_col_clusters_plus_one_empty = self._n_features_per_view[view_index] if \
+            ((self._n_col_clusters[view_index] + 1) > self._n_features_per_view[view_index]) else (self._n_col_clusters[view_index] + 1)
 
-        all_delta_tau_c = self._delta_tau_c_cumulative(view, self._tot_t_per_rc[view], sum_lambdas, lambdas,
+        all_delta_tau_c = self._delta_tau_c_cumulative(view_index, self._tot_t_per_rc[view_index], sum_lambdas, lambdas,
                                                        selected_cluster)
 
         # consider all partitions of the neighborhood of the randomly selected cluster, i.e. partitions where the
@@ -1049,18 +1147,18 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
         if len(equal_solutions) > 1 and min_delta_tau_c != 0:
             # choose the best destination cluster
-            e_min = self._find_non_dominated_col(view, equal_solutions, lambdas, selected_cluster)
+            e_min = self._find_non_dominated_col(view_index, equal_solutions, lambdas, selected_cluster)
 
         go_on_normally = True
 
         # if the number of clusters is already at minimum value (2) we cant remove another cluster
-        if self._n_col_clusters[view] == 2:
-            go_on_normally = self._check_col_clustering_size(view, selected_cluster)
+        if self._n_col_clusters[view_index] == 2:
+            go_on_normally = self._check_col_clustering_size(view_index, selected_cluster)
 
         if min_delta_tau_c != 0 and go_on_normally:
-            self._col_assignment[view][selected_feature] = e_min
-            self._modify_col_cluster(view, lambdas, selected_cluster, e_min)
-            self._update_I_and_C()
+            self._col_assignment[view_index][selected_feature] = e_min
+            self._modify_col_cluster(view_index, lambdas, selected_cluster, e_min)
+            self._update_intermediate_values_after_column_move(view_index)
         else:
             logging.debug("[INFO] Ignored move of {2} from col cluster {0} to {1}".format(selected_cluster,
                                                                                          e_min, selected_feature))
@@ -1109,7 +1207,18 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         return sum_f
 
     def _delta_tau_c(self, view, tot_t_per_rc, sum_lambdas, lambdas, original_cluster, destination_cluster):
+        """
+        Compute the variation of the delta value when moving a column from the original cluster
+        to the destination cluster.
 
+        :param view: the view that contains the column
+        :param tot_t_per_rc: sum of the elements of each row cluster
+        :param sum_lambdas: sum of row values for the element to be moved
+        :param lambdas: sum of row values divided by row cluster
+        :param original_cluster: the cluster that originally contains the element
+        :param destination_cluster: the cluster into which move the column
+        :return: the computed value
+        """
         if original_cluster == destination_cluster:
             return 0.0
 
@@ -1139,7 +1248,17 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         return delta_tau_c
 
     def _delta_tau_c_cumulative(self, view, tot_t_per_rc, sum_lambdas, lambdas, original_cluster):
+        """
+        Compute the delta values for each possible destination cluster (including the empty one)
 
+        :param view: the view that contains the column
+        :param tot_t_per_rc: sum of the elements of each row cluster
+        :param sum_lambdas: sum of row values for the element to be moved
+        :param lambdas: sum of row values divided by row cluster
+        :param original_cluster: the cluster that originally contains the element
+
+        :return: a list of delta values, one for each element
+        """
         computed_taus = [0.0] * (self._n_col_clusters[view] + 1)
         t_cc_orig = self._T[view][:,original_cluster]
         division_one = np.true_divide(lambdas, tot_t_per_rc)
@@ -1180,7 +1299,6 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         Considers all specified column clusters c, emulates the move of the object from the source_cluster to c and
           computes the tau_r value for the obtained combination of row and col clustering. Returns the col cluster index
           that minimize the tau_r value.
-          
         :param view: int, the view to consider
         :param col_clusters_to_evaluate: array, the list of col clusters to consider
         :param lambdas: the lambdas value related to the feature to move from the source cluster
@@ -1193,7 +1311,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         best_solution = col_clusters_to_evaluate[0]
         tau_r_best = self._compute_emulated_tau_r(view, lambdas, source_cluster, best_solution)
 
-        for ci in range(len(col_clusters_to_evaluate)):
+        for ci in range(1, len(col_clusters_to_evaluate)):
             evaluated_solution = col_clusters_to_evaluate[ci]
             tau_r_evaluated = self._compute_emulated_tau_r(view, lambdas, source_cluster, evaluated_solution)
 
@@ -1263,14 +1381,14 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             # tot_t_square_per_rc has to be completely updated for the considered view
             # tot_t_per_cc and tot_t_square_per_cc change only for the considered view
             lambda_tot = np.sum(lambda_t)
-            t_square = np.power(self._T[view], 2)
+            self._t_square[view] = np.power(self._T[view], 2)
             self._tot_t_per_cc[view][source_cc] -= lambda_tot
             self._tot_t_per_cc[view] = np.concatenate((self._tot_t_per_cc[view], [lambda_tot]))
-            self._tot_t_square_per_cc[view][source_cc] = np.sum(t_square[:, source_cc])
+            self._tot_t_square_per_cc[view][source_cc] = np.sum(self._t_square[view][:, source_cc])
             self._tot_t_square_per_cc[view] = np.concatenate((self._tot_t_square_per_cc[view],
-                                                              [np.sum(t_square[:, self._n_col_clusters[view]])]))
+                                                              [np.sum(self._t_square[view][:, self._n_col_clusters[view]])]))
 
-            self._tot_t_square_per_rc[view] = np.sum(t_square, 1)
+            self._tot_t_square_per_rc[view] = np.sum(self._t_square[view], 1)
 
             self._n_col_clusters[view] += 1
 
@@ -1284,12 +1402,13 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             # tot_t_square_per_rc has to be completely updated
             # tot_t_per_cc and tot_t_square_per_cc change only for the considered view
             lambda_tot = np.sum(lambda_t)
-            t_square = np.power(self._T[view], 2)
+            # TODO is only necessary to update t_square
+            self._t_square[view] = np.power(self._T[view], 2)
             self._tot_t_per_cc[view][source_cc] -= lambda_tot
             self._tot_t_per_cc[view][destination_cc] += lambda_tot
-            self._tot_t_square_per_cc[view][source_cc] = np.sum(t_square[:, source_cc])
-            self._tot_t_square_per_cc[view][destination_cc] = np.sum(t_square[:, destination_cc])
-            self._tot_t_square_per_rc[view] = np.sum(t_square, 1)
+            self._tot_t_square_per_cc[view][source_cc] = np.sum(self._t_square[view][:, source_cc])
+            self._tot_t_square_per_cc[view][destination_cc] = np.sum(self._t_square[view][:, destination_cc])
+            self._tot_t_square_per_rc[view] = np.sum(self._t_square[view], 1)
 
             is_empty = not self._check_col_clustering_size(view, source_cc, min_number_of_elements=1)
 
@@ -1323,15 +1442,12 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         :param destination_cc: int, the column cluster into which we want to move the feature x
         :return: the value of compute_tau_r function after the simulated move
         """
-        temp_n_col_clusters = self._n_col_clusters[view]
         temp_t_v = np.copy(self._T[view])
 
-        if destination_cc == temp_n_col_clusters:
+        if destination_cc == self._n_col_clusters[view]:
             temp_t_v[:, source_cc] = np.subtract(temp_t_v[:, source_cc], lambdas)
             # append the new column
             temp_t_v = np.append(temp_t_v, lambdas[np.newaxis].T, axis=1)
-
-            temp_n_col_clusters += 1
         else:
             # the destination is an already existent cluster
             # check that the original cluster will not be empty
@@ -1342,10 +1458,29 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
             if is_empty:
                 # delete the source column
-                temp_n_col_clusters -= 1
                 temp_t_v = np.delete(temp_t_v, source_cc, 1)
 
-        return self._compute_tau_r(view, temp_t_v, temp_n_col_clusters)
+        return self._compute_tau_r(view, temp_t_v)
+
+
+    def fit_predict(self, V, y=None):
+        """
+        Parameters
+        -----------
+
+        V : list of array-like or sparse matrices, one for each view;
+            shape of each matrix = (n_samples, n_features_in_view)
+
+        y : unused parameter
+
+        Returns
+        --------
+
+        TODO
+        :param self:
+
+        """
+        raise Exception("To be implemented")
 
 
 def get_element(matrix, row, col):
