@@ -18,7 +18,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
     """ CoStar algorithm (Ienco, 2013).
 
     CoStar is an algorithm created to deal with multi-view data.
-    It found automatically the best number of row / column clusters.
+    It finds automatically the best number of row / column clusters.
 
     Parameters
     ------------
@@ -54,6 +54,9 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
     columns_ : array-like, shape (n_view, n_features_per_view)
         Results of the clustering on columns, for each view is like `rows`.
+
+    execution_time_ : float
+        The execution time.
 
     References
     ----------
@@ -1046,7 +1049,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         logging.debug("[INFO] Move element from row cluster {0} to {1}".format(source_rc, destination_rc))
 
         if destination_rc == self._n_row_clusters:
-            # the destination cluster is a new one
+            # case 1) the destination cluster is a new one
             logging.debug("[INFO] Create new cluster {0}".format(destination_rc))
 
             for view in range(self._n_views):
@@ -1061,11 +1064,15 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 # we have to remove from tot_t_per_rc[view][source_rc] the value sum(lambda_t[view])
                 # we have to add a new element to tot_t_per_rc[view] equal to sum(lambda_t[view])
                 lambda_tot = np.sum(lambda_t[view])
+
                 self._tot_t_per_rc[view][source_rc] -= lambda_tot
                 self._tot_t_per_rc[view] = np.concatenate((self._tot_t_per_rc[view], [lambda_tot]))
+
                 # for squares we have to recompute the squares for the source_rc
                 # and to add the new value to the new cluster
-                self._t_square[view] = np.power(self._T[view], 2)
+                self._t_square[view] = np.concatenate((self._t_square[view], [np.power(lambda_t[view], 2)]), axis=0)
+                self._t_square[view][source_rc] = np.power(self._T[view][source_rc], 2)
+
                 self._tot_t_square_per_rc[view][source_rc] = np.sum(self._t_square[view][source_rc])
                 self._tot_t_square_per_rc[view] = np.concatenate(
                     (self._tot_t_square_per_rc[view],
@@ -1076,6 +1083,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
 
             self._n_row_clusters += 1
         else:
+            # case 2) the destination cluster already exists
             # we move the object x from the original cluster to the destination cluster
             for view in range(self._n_views):
                 for cc in range(self._n_col_clusters[view]):
@@ -1087,14 +1095,19 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 # we have to remove from tot_t_per_rc[view][source_rc] the value sum(lambda_t[view])
                 # we have to add a new element to tot_t_per_rc[view] equal to sum(lambda_t[view])
                 lambda_tot = np.sum(lambda_t[view])
-                # todo is only necessary to update t square
-                self._t_square[view] = np.power(self._T[view], 2)
+
+                # update only modified rows
+                self._t_square[view][source_rc] = np.power(self._T[view][source_rc], 2)
+                self._t_square[view][destination_rc] = np.power(self._T[view][destination_rc], 2)
+
                 self._tot_t_per_rc[view][source_rc] -= lambda_tot
                 self._tot_t_per_rc[view][destination_rc] += lambda_tot
+
                 # for squares we have to recompute the squares for the source_rc
                 # and to add the new value to the new cluster
                 self._tot_t_square_per_rc[view][source_rc] = np.sum(self._t_square[view][source_rc])
                 self._tot_t_square_per_rc[view][destination_rc] = np.sum(self._t_square[view][destination_rc])
+
                 # completely update tot_square_per_cc
                 self._tot_t_square_per_cc[view] = np.sum(self._t_square[view], 0)
 
@@ -1106,6 +1119,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
                 for view in range(self._n_views):
                     # delete the source_rc row
                     self._T[view] = np.delete(self._T[view], source_rc, 0)
+                    self._t_square[view] = np.delete(self._t_square[view], source_rc, 0)
                     # update the total values removing the source cluster item
                     self._tot_t_per_rc[view] = np.delete(self._tot_t_per_rc[view], source_rc)
                     self._tot_t_square_per_rc[view] = np.delete(self._tot_t_square_per_rc[view], source_rc)
@@ -1367,7 +1381,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
         """
         logging.debug("[INFO] Move element from col cluster {0} to {1}".format(source_cc, destination_cc))
         if destination_cc == self._n_col_clusters[view]:
-            # the destination col cluster is an empty one
+            # case 1) the destination col cluster is an empty one
             logging.debug("[INFO] Create new col cluster {0}".format(destination_cc))
 
             # update the source cluster values
@@ -1380,10 +1394,14 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             # tot_t_per_rc doesn't change
             # tot_t_square_per_rc has to be completely updated for the considered view
             # tot_t_per_cc and tot_t_square_per_cc change only for the considered view
+
+            self._t_square[view] = np.append(self._t_square[view], np.power(lambda_t[np.newaxis].T, 2), axis=1)
+            self._t_square[view][:, source_cc] = np.power(self._T[view][:, source_cc], 2)
+
             lambda_tot = np.sum(lambda_t)
-            self._t_square[view] = np.power(self._T[view], 2)
             self._tot_t_per_cc[view][source_cc] -= lambda_tot
             self._tot_t_per_cc[view] = np.concatenate((self._tot_t_per_cc[view], [lambda_tot]))
+
             self._tot_t_square_per_cc[view][source_cc] = np.sum(self._t_square[view][:, source_cc])
             self._tot_t_square_per_cc[view] = np.concatenate((self._tot_t_square_per_cc[view],
                                                               [np.sum(self._t_square[view][:, self._n_col_clusters[view]])]))
@@ -1393,7 +1411,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             self._n_col_clusters[view] += 1
 
         else:
-            # the destination cluster is an existent one
+            # case 2) the destination cluster is an existent one
             self._T[view][:, source_cc] = np.subtract(self._T[view][:, source_cc], lambda_t)
             self._T[view][:, destination_cc] = np.add(self._T[view][:, destination_cc], lambda_t)
 
@@ -1402,12 +1420,16 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             # tot_t_square_per_rc has to be completely updated
             # tot_t_per_cc and tot_t_square_per_cc change only for the considered view
             lambda_tot = np.sum(lambda_t)
-            # TODO is only necessary to update t_square
-            self._t_square[view] = np.power(self._T[view], 2)
+
+            self._t_square[view][:, source_cc] = np.power(self._T[view][:, source_cc], 2)
+            self._t_square[view][:, destination_cc] = np.power(self._T[view][:, destination_cc], 2)
+
             self._tot_t_per_cc[view][source_cc] -= lambda_tot
             self._tot_t_per_cc[view][destination_cc] += lambda_tot
+
             self._tot_t_square_per_cc[view][source_cc] = np.sum(self._t_square[view][:, source_cc])
             self._tot_t_square_per_cc[view][destination_cc] = np.sum(self._t_square[view][:, destination_cc])
+
             self._tot_t_square_per_rc[view] = np.sum(self._t_square[view], 1)
 
             is_empty = not self._check_col_clustering_size(view, source_cc, min_number_of_elements=1)
@@ -1415,6 +1437,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             if is_empty:
                 # compact the contingency matrix to remove the empty cluster
                 self._T[view] = np.delete(self._T[view], source_cc, 1)
+                self._t_square = np.delete(self._t_square, source_cc, 1)
 
                 # compact the totals arrays
                 self._tot_t_per_cc[view] = np.delete(self._tot_t_per_cc[view], source_cc)
