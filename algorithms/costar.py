@@ -1437,7 +1437,7 @@ class CoStar(BaseEstimator, ClusterMixin, TransformerMixin):
             if is_empty:
                 # compact the contingency matrix to remove the empty cluster
                 self._T[view] = np.delete(self._T[view], source_cc, 1)
-                self._t_square = np.delete(self._t_square, source_cc, 1)
+                self._t_square[view] = np.delete(self._t_square[view], source_cc, 1)
 
                 # compact the totals arrays
                 self._tot_t_per_cc[view] = np.delete(self._tot_t_per_cc[view], source_cc)
